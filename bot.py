@@ -1,82 +1,79 @@
-import os, asyncio, datetime as dt
-from typing import Dict
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import os
+import logging
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
+# --- ЛОГИ ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+# --- ЧТЕНИЕ ПЕРЕМЕННЫХ ИЗ ОКРУЖЕНИЯ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+SPREADSHEET_ID = os.getenv("MASTER_SPREADSHEET_ID")
 GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
-MASTER_SPREADSHEET_ID = os.getenv("MASTER_SPREADSHEET_ID")
 
-def gs_client():
-    import json
-    data = json.loads(GOOGLE_SA_JSON)
-    creds = Credentials.from_service_account_info(
-        data,
-        scopes=["https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive"]
-    )
-    return gspread.authorize(creds)
+# --- НАСТРОЙКА ДОСТУПА К GOOGLE SHEETS ---
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_dict(eval(GOOGLE_SA_JSON), scope)
+client = gspread.authorize(creds)
+sheet = client.open_by_key(SPREADSHEET_ID)
 
-gc = gs_client()
-sh = gc.open_by_key(MASTER_SPREADSHEET_ID)
-
-def ws(name: str):
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: получение текста из таблицы ---
+def get_text(key: str) -> str:
     try:
-        return sh.worksheet(name)
-    except gspread.WorksheetNotFound:
-        return sh.add_worksheet(title=name, rows=1000, cols=20)
+        worksheet = sheet.worksheet("Content")
+        data = worksheet.get_all_records()
+        for row in data:
+            if row["key"] == key:
+                return row["value"]
+    except Exception as e:
+        logging.error(f"Ошибка при получении текста: {e}")
+    return "Текст не найден."
 
-intake_ws = ws("Intake")
-content_ws = ws("Content")
-
-def read_content() -> Dict[str, str]:
-    rows = content_ws.get_all_values()
-    d = {}
-    for r in rows[1:]:
-        if len(r) >= 2 and r[0]:
-            d[r[0]] = r[1]
-    return d
-
-def append_intake(uid, uname, action):
-    intake_ws.append_row([
-        dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        uid, uname or "", action
-    ], value_input_option="USER_ENTERED")
-
+# --- ОБРАБОТЧИК /start ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    content = read_content()
-    text = content.get("start_intro_text", "Привет! Я бот тренировочного дневника.")
-    kb = [
-        [InlineKeyboardButton("Хочу ознакомиться", callback_data="learn_more")],
+    keyboard = [
+        [InlineKeyboardButton("Хочу ознакомиться", callback_data="learn")],
         [InlineKeyboardButton("Я действующий подопечный", callback_data="current")]
     ]
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(get_text("start_intro_text"), reply_markup=reply_markup)
 
-async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    content = read_content()
-    user = update.effective_user
+# --- ОБРАБОТКА НАЖАТИЙ КНОПОК ---
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-    if q.data == "learn_more":
-        append_intake(user.id, user.username, "learn")
-        text = content.get("learn_more_text", "Презентация дневника и условия…")
-        trainer_username = content.get("trainer_username", "bezha_nova")
-        kb = [[InlineKeyboardButton("Перейти к тренеру", url=f"https://t.me/{trainer_username}")]]
-        await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    action = query.data
+    user = query.from_user
 
-    elif q.data == "current":
-        append_intake(user.id, user.username, "current")
-        text = content.get("active_soon_text", "Скоро здесь появятся твои тренировки.")
-        await q.message.reply_text(text)
+    # Запись данных в Intake
+    try:
+        intake_sheet = sheet.worksheet("Intake")
+        intake_sheet.append_row([str(user.id), user.username, action])
+    except Exception as e:
+        logging.error(f"Ошибка записи в Intake: {e}")
 
+    if action == "learn":
+        await query.edit_message_text(get_text("learn_more_text"))
+    elif action == "current":
+        await query.edit_message_text(get_text("active_soon_text"))
+    else:
+        await query.edit_message_text("Ошибка, попробуй снова.")
+
+# --- ЗАПУСК БОТА ---
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(buttons))
-    app.run_polling()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button))
+
+    logging.info("Бот запущен...")
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
